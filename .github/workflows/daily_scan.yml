@@ -1,0 +1,50 @@
+name: A股智能选股系统 - 每日自动扫描
+
+on:
+  schedule:
+    - cron: '0 1 * * 1-5'   # 工作日北京时间 09:00（UTC 01:00）
+    - cron: '0 2 * * 6'     # 周六北京时间 10:00（UTC 02:00）深度分析
+  workflow_dispatch:        # 允许随时手动触发
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖包
+        run: pip install -r requirements.txt
+
+      - name: 运行选股扫描
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          EMAIL_SENDER:     ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:   ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVER:   ${{ secrets.EMAIL_RECEIVER }}
+        run: python src/scanner.py
+
+      - name: 上传报告文件
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stock-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+
+      - name: 提交报告到仓库
+        if: success()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add reports/ || true
+          git diff --staged --quiet || git commit -m "📊 自动报告 $(date '+%Y-%m-%d')"
+          git push || true
