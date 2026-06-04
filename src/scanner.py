@@ -488,81 +488,116 @@ def ai_closing_analysis(policy_news, stocks, northbound,
     """收盘复盘版AI分析"""
     policy_text = "\n".join(policy_news) if policy_news else "今日暂无明显政策信号"
 
+    # 数据完整性检查
+    has_tech    = len(stocks) > 0
+    has_north   = northbound.get("total", 0) != 0
+    has_dt      = len(dragon_tiger) > 0
+    has_flow    = len(capital_flow) > 0
+    has_block   = len(block_trade) > 0
+    data_score  = sum([has_tech, has_north, has_dt, has_flow, has_block])
+
+    # 数据缺失时直接返回，不让AI乱编
+    if data_score == 0:
+        return """⚠️ 数据缺失提醒
+
+今日技术面、资金面数据均未获取到，原因可能是：
+1. 当前时间不在有效数据窗口内（建议在18:00-20:00之间运行）
+2. 数据接口今日异常
+
+本次报告无法生成有效的选股建议，请等待明日正常时间窗口的自动报告。
+
+不建议基于本次报告做任何投资操作。"""
+
     north_text = f"北向资金今日净流入：{northbound.get('total', 0)} 亿\n"
     if northbound.get("top_stocks"):
         north_text += "北向重仓：" + "、".join(
             f"{s.get('name','')}({round(safe_float(s.get('net_amount',0))/1e8,1)}亿)"
             for s in northbound["top_stocks"][:5]
         )
+    elif not has_north:
+        north_text = "北向资金：今日数据未获取"
 
     dt_text = "\n".join(
         f"- {s['name']}（{s['code']}）：{s['signal']}"
         for s in dragon_tiger
-    ) or "今日暂无机构龙虎榜"
+    ) or "今日龙虎榜数据未获取"
 
     block_text = "\n".join(
         f"- {s['name']}：成交{s['amount_wan']}万，折价{s['discount_rate']}%"
         for s in block_trade
-    ) or "今日暂无折价大宗"
+    ) or "今日大宗交易数据未获取"
 
     flow_text = "\n".join(
         f"- {s['name']}：主力净流入{s['net_flow_yi']}亿，涨幅{s['change_pct']}%"
         for s in capital_flow
-    ) or "暂无数据"
+    ) or "今日主力资金数据未获取"
 
     stocks_text = "\n".join(
         f"- {s['name']}（{s['code']}）：收涨{s['change_pct']}%，"
         f"换手{s['turnover_rate']}%，量比{s['volume_ratio']}，"
         f"技术面：{build_tech_summary(s)}"
         for s in stocks
-    ) or "今日暂无符合条件的标的"
+    ) or "今日技术面筛选无符合条件标的"
 
-    prompt = f"""今天是{TODAY_CN}，收盘后复盘，请基于完整的技术面和资金面数据筛选明日值得关注的标的。
+    # 数据完整性警告
+    missing = []
+    if not has_tech:   missing.append("技术面筛选标的")
+    if not has_north:  missing.append("北向资金")
+    if not has_dt:     missing.append("龙虎榜")
+    if not has_flow:   missing.append("主力资金流向")
+    if not has_block:  missing.append("大宗交易")
+    warning = f"⚠️ 以下数据今日未获取：{' / '.join(missing)}\n缺失数据对应维度不得推断或假设，直接标注"数据缺失"。\n\n" if missing else ""
+
+    prompt = f"""今天是{TODAY_CN}，收盘后复盘。
+
+{warning}【重要规则——必须严格遵守】
+1. 对于数据缺失的维度，必须直接写"数据缺失，无法评估"，禁止假设、推断或编造任何技术形态
+2. 如果技术面和资金面数据同时缺失，该标的综合评分不得超过3分
+3. 评分必须真实反映数据支撑程度，不得因为政策面好就给高分
+4. 没有技术面确认的标的，操作建议只能写"等待技术面确认后再介入"
 
 【政策信号】
 {policy_text}
 
-【北向资金（收盘完整数据）】
+【北向资金】
 {north_text}
 
 【龙虎榜机构席位】
 {dt_text}
 
-【大宗交易折价（主力建仓信号）】
+【大宗交易折价】
 {block_text}
 
 【主力资金净流入排行】
 {flow_text}
 
-【技术面精筛标的（均线+MACD+量能多维筛选）】
+【技术面精筛标的】
 {stocks_text}
 
 请输出收盘复盘报告：
 
 **一、今日市场总结**
-- 今日板块轮动情况
-- 资金主线方向
+- 今日板块轮动情况（仅基于真实数据）
+- 资金主线方向（如数据缺失直接说明）
 - 明日市场情绪预判
 
 **二、明日重点关注标的**
-综合技术面+资金面+政策面，筛选3-5只明日值得跟踪的标的，每只给出：
-- 入选理由（必须同时说明：技术面+资金面+政策面哪些维度支撑）
-- 技术结构评价（均线/MACD/量能）
-- 关键价位（支撑位/压力位）
-- 建议操作（明日开盘如何跟进）
-- 综合评分（1-10分）
+只推荐有真实数据支撑的标的，每只注明：
+- 有数据支撑的维度（技术面/资金面/政策面）
+- 数据缺失的维度（直接标注"缺失"）
+- 技术结构评价（无数据则写"数据缺失，待确认"）
+- 关键价位（有数据则给出，无数据则写"待确认"）
+- 综合评分（严格按数据支撑度打分）
 
 **三、明日操作策略**
-- 首选标的（1只，最高确定性）
-- 备选标的（1-2只）
-- 需要止损回避的情景
+- 数据支撑充分的标的才列为首选
+- 数据不足的只能列为"待观察"
+- 明确说明本次报告的数据完整度
 
-直接给判断，不要废话。"""
+直接给判断，不编造任何数据。"""
 
     print("AI收盘复盘分析...")
     return ask_deepseek(prompt, max_tokens=2500)
-
-
 def ai_deep_analysis(stocks: list) -> str:
     """周末深度分析"""
     if not stocks:
