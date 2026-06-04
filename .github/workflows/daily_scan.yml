@@ -2,9 +2,9 @@ name: A股智能选股系统 - 每日自动扫描
 
 on:
   schedule:
-    - cron: '0 1 * * 1-5'   # 工作日北京时间 09:00（UTC 01:00）
-    - cron: '0 2 * * 6'     # 周六北京时间 10:00（UTC 02:00）深度分析
-  workflow_dispatch:        # 允许随时手动触发
+    - cron: '0 1 * * 1-5'   # 工作日北京时间 09:00
+    - cron: '0 2 * * 6'     # 周六北京时间 10:00 深度分析
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -27,12 +27,13 @@ jobs:
       - name: 运行选股扫描
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          TUSHARE_TOKEN:    ${{ secrets.TUSHARE_TOKEN }}
           EMAIL_SENDER:     ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD:   ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVER:   ${{ secrets.EMAIL_RECEIVER }}
         run: python src/scanner.py
 
-      - name: 上传报告文件
+      - name: 上传报告
         uses: actions/upload-artifact@v4
         if: always()
         with:
