@@ -550,7 +550,7 @@ def get_inst_survey() -> list:
         start = (_bj - datetime.timedelta(days=7)).strftime("%Y%m%d")
         df = pro.stk_surv(start_date=start, end_date=end)
         if df is not None and len(df) > 0:
-            df["fund_nums"] = pd.to_numeric(df.get("fund_nums", 0), errors="coerce").fillna(0)
+            df["fund_nums"] = pd.to_numeric(df["fund_nums"] if "fund_nums" in df.columns else 0, errors="coerce").fillna(0)
             for _, row in df.nlargest(10, "fund_nums").iterrows():
                 result.append({
                     "name":      row.get("name", ""),
@@ -601,18 +601,25 @@ def get_forecast() -> list:
     result = []
     try:
         # 获取近期业绩预告（上调评级）
-        df = pro.forecast(
-            ann_date=TODAY,
-            fields="ts_code,ann_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max,summary"
-        )
-        if df is None or len(df) == 0:
-            # 扩大到最近7天
-            start = (_bj - datetime.timedelta(days=7)).strftime("%Y%m%d")
+        # 先查今日，再查近7天
+        df = None
+        try:
             df = pro.forecast(
-                start_date=start,
-                end_date=TODAY,
-                fields="ts_code,ann_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max,summary"
+                ann_date=TODAY,
+                fields="ts_code,ann_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max"
             )
+        except Exception:
+            pass
+        if df is None or len(df) == 0:
+            start = (_bj - datetime.timedelta(days=7)).strftime("%Y%m%d")
+            try:
+                df = pro.forecast(
+                    start_date=start,
+                    end_date=TODAY,
+                    fields="ts_code,ann_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max"
+                )
+            except Exception:
+                pass
         if df is not None and len(df) > 0:
             # 筛选业绩大幅增长的（净利润增速>50%）
             df["p_change_max"] = pd.to_numeric(df.get("p_change_max", 0), errors="coerce")
@@ -1079,11 +1086,12 @@ def build_html(title, mode, ai_report, deep_report, stocks,
     '''
     extra_sections = ""
     if forecast:
+        fc_list = forecast[:5] if forecast else []
         fc_rows = "".join(
-            f"<tr><td style='padding:5px 8px'>{s.get('name',s['code'])}</td>"
-            f"<td style='padding:5px 8px;text-align:right;color:#d63031;font-weight:500'>+{s['pct_max']}%</td>"
-            f"<td style='padding:5px 8px;color:#888;font-size:11px'>{s['ann_date']}</td></tr>"
-            for s in forecast[:5]
+            "<tr><td style='padding:5px 8px'>" + str(item.get("name", item.get("code",""))) + "</td>"
+            "<td style='padding:5px 8px;text-align:right;color:#d63031;font-weight:500'>+" + str(item.get("pct_max","")) + "%</td>"
+            "<td style='padding:5px 8px;color:#888;font-size:11px'>" + str(item.get("ann_date","")) + "</td></tr>"
+            for item in fc_list
         )
         extra_sections += (
             "<div style='margin-bottom:16px'>"
@@ -1096,11 +1104,12 @@ def build_html(title, mode, ai_report, deep_report, stocks,
             f"</tr></thead><tbody>{fc_rows}</tbody></table></div>"
         )
     if broker_rec:
+        br_list = broker_rec[:5] if broker_rec else []
         br_rows = "".join(
-            f"<tr><td style='padding:5px 8px'>{s['name']}</td>"
-            f"<td style='padding:5px 8px;text-align:center;color:#6c5ce7;font-weight:500'>{s['broker_count']}家</td>"
-            f"<td style='padding:5px 8px;color:#888;font-size:11px'>{s['brokers']}</td></tr>"
-            for s in broker_rec[:5]
+            "<tr><td style='padding:5px 8px'>" + str(item.get("name","")) + "</td>"
+            "<td style='padding:5px 8px;text-align:center;color:#6c5ce7;font-weight:500'>" + str(item.get("broker_count","")) + "家</td>"
+            "<td style='padding:5px 8px;color:#888;font-size:11px'>" + str(item.get("brokers","")) + "</td></tr>"
+            for item in br_list
         )
         extra_sections += (
             "<div style='margin-bottom:16px'>"
