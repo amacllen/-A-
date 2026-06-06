@@ -33,7 +33,8 @@ pro = ts.pro_api()
 EMAIL_SENDER   = os.environ["EMAIL_SENDER"]
 EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
 EMAIL_RECEIVER = os.environ["EMAIL_RECEIVER"]
-
+EMAIL_RECEIVER_2 = os.environ.get("EMAIL_RECEIVER_2", "")
+EMAIL_RECEIVER_3 = os.environ.get("EMAIL_RECEIVER_3", "")
 # 使用北京时间（UTC+8）
 _beijing_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
 TODAY    = _beijing_now.strftime("%Y%m%d")
@@ -823,7 +824,8 @@ def send_email(subject: str, html: str):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = EMAIL_SENDER
-    msg["To"]      = EMAIL_RECEIVER
+    receivers = [r for r in [EMAIL_RECEIVER, EMAIL_RECEIVER_2, EMAIL_RECEIVER_3] if r]
+    msg["To"] = ", ".join(receivers)
     msg.attach(MIMEText(html, "html", "utf-8"))
     try:
         server = (smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15)
@@ -831,7 +833,7 @@ def send_email(subject: str, html: str):
         if not use_ssl:
             server.starttls()
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        server.sendmail(EMAIL_SENDER, receivers, msg.as_string())
         server.quit()
         print("邮件发送成功！")
     except Exception as e:
