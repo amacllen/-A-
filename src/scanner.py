@@ -267,46 +267,48 @@ def fetch_announcements() -> list:
 
 def get_morning_news() -> list:
     """
-    今日新闻快讯（已验证：Tushare news接口盘中有效，162行）
-    严格过滤只保留今日数据
+    今日新闻快讯
+    不做关键词过滤，把今日所有财经新闻标题传给AI
+    由AI判断哪些重要，避免关键词匹配失败导致AI用历史信息填充
     """
     print("【上午新闻】Tushare实时新闻...")
     result = []
     today_str = _bj.strftime("%Y-%m-%d")
-    for src in ["cls", "sina", "10jqka"]:
+    for src in ["cls", "sina"]:
         try:
             df = pro.news(
                 src=src,
                 start_date=today_str + " 00:00:00",
                 end_date=today_str + " 23:59:59",
-                fields="datetime,title,content"
+                fields="datetime,title"
             )
             if df is None or len(df) == 0:
+                print(f"  {src}新闻：今日暂无")
                 continue
-            count = 0
             for _, row in df.iterrows():
                 pub_time = str(row.get("datetime", ""))
+                # 严格验证是今天
                 if today_str not in pub_time:
                     continue
-                title = str(row.get("title", ""))
-                text  = title + str(row.get("content", ""))[:80]
-                if any(k in text for k in POLICY_KEYWORDS):
-                    time_str = pub_time[11:16] if len(pub_time) > 10 else ""
-                    result.append({
-                        "time":  time_str,
-                        "title": title[:180],
-                        "src":   src.upper(),
-                    })
-                    count += 1
-            if count > 0:
-                print(f"  {src.upper()}新闻：今日政策相关{count}条")
+                title = str(row.get("title", "")).strip()
+                if len(title) < 5:
+                    continue
+                time_str = pub_time[11:16] if len(pub_time) > 10 else ""
+                result.append({
+                    "time":  time_str,
+                    "title": title[:150],
+                    "src":   src.upper(),
+                })
+            if result:
+                print(f"  {src.upper()}新闻：今日{len(result)}条")
                 break
         except Exception as e:
             print(f"  {src}新闻失败: {e}")
 
     if not result:
-        print("  今日新闻：暂无政策相关（数据为空）")
-    return result[:15]
+        print("  今日新闻：暂无数据")
+    # 最多取30条，按时间倒序（最新的在前）
+    return result[:30]
 
 
 def get_morning_announcements() -> list:
@@ -1075,8 +1077,14 @@ def ai_closing_report(policy_news, stocks, market_sentiment,
                        block_trade, sector_flow, broker_rec,
                        financial=None) -> str:
     """收盘深度报告AI分析"""
-    policy_text = ("【以下均为今日（" + TODAY_CN + "）发布的政策信号】\n" +
-                   "\n".join(policy_news[:12])) if policy_news else "今日暂无政策信号（数据为空，不得引用任何历史政策）"
+    if policy_news:
+        policy_text = (
+            "【以下是今日（" + TODAY_CN + "）的财经新闻，请从中识别有价值的政策信号】\n"
+            + "\n".join(policy_news[:20])
+            + "\n\n【重要】只分析以上列表中实际存在的新闻，列表之外的任何信息禁止引用。"
+        )
+    else:
+        policy_text = "今日政策新闻：无数据（禁止推断或引用任何历史政策信息）"
 
     ms = market_sentiment
     sentiment_text = (
@@ -1148,7 +1156,13 @@ def ai_closing_report(policy_news, stocks, market_sentiment,
 
     prompt = f"""今天是{TODAY_CN}，收盘后复盘。
 
-{warning}【当前市场主要驱动逻辑】
+{warning}
+【铁律——违反以下规则即为无效分析】
+1. 政策分析只能引用上方"今日财经新闻"列表中实际存在的条目，列表为空则写"今日无政策催化"
+2. 数据缺失的维度直接标注"数据缺失"，不得用任何历史数据或常识补充
+3. 推荐标的必须有本报告中实际出现的数据支撑（技术评分/资金流/券商推荐），三者均无则不推荐
+
+【当前市场主要驱动逻辑】
 {driver}
 
 【市场情绪】
