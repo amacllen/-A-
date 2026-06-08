@@ -28,7 +28,7 @@ jobs:
           EMAIL_SENDER:     ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD:   ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVER:   ${{ secrets.EMAIL_RECEIVER }}
-        run: python src/check_moneyflow.py
+        run: python src/scanner.py
 
       - name: 上传报告
         uses: actions/upload-artifact@v4
