@@ -273,6 +273,7 @@ def get_morning_news() -> list:
     """
     print("【上午新闻】Tushare实时新闻...")
     result = []
+    seen = set()  # 标题去重
     today_str = _bj.strftime("%Y-%m-%d")
     for src in ["cls", "sina"]:
         try:
@@ -293,6 +294,9 @@ def get_morning_news() -> list:
                 title = str(row.get("title", "")).strip()
                 if len(title) < 5:
                     continue
+                if title in seen:        # CLS会重复推送同一条，去重
+                    continue
+                seen.add(title)
                 time_str = pub_time[11:16] if len(pub_time) > 10 else ""
                 result.append({
                     "time":  time_str,
@@ -382,11 +386,14 @@ def get_yesterday_capital() -> dict:
                 pd.to_numeric(df["sell_elg_amount"], errors="coerce").fillna(0) -
                 pd.to_numeric(df["sell_lg_amount"],  errors="coerce").fillna(0)
             )
+            names_map = get_stock_names()
             for _, row in df.nlargest(8, "big_net").iterrows():
                 net = safe_float(row.get("big_net", 0))
                 if net > 0:
+                    code = row["ts_code"]
                     result["top_moneyflow"].append({
-                        "code":    row["ts_code"],
+                        "code":    code,
+                        "name":    names_map.get(code, ("", ""))[0],
                         "net_yi":  round(net / 1e4, 2),  # moneyflow金额单位万元，÷1e4得亿
                     })
         print(f"  昨日主力净流入：{len(result['top_moneyflow'])}只")
@@ -894,7 +901,7 @@ def ai_morning_report(news_data, announcements, yest_capital) -> str:
     yc = yest_capital
     dt_names  = "、".join(f"{s['name']}" for s in yc.get("dragon_tiger",[])[:5]) or "暂无"
     mf_text   = "、".join(
-        f"{s['code']}(+{s['net_yi']}亿)" for s in yc.get("top_moneyflow",[])[:5]
+        f"{s.get('name','')}({s['code']},+{s['net_yi']}亿)" for s in yc.get("top_moneyflow",[])[:5]
     ) or "暂无"
     ydate_str = (_bj - datetime.timedelta(days=1)).strftime("%m月%d日")
 
@@ -947,10 +954,11 @@ def build_morning_html(title, ai_report, news_data, announcements, yest_capital)
 
     # 昨日主力资金
     mf_rows = "".join(
-        f"<tr><td style='padding:5px 8px'>{s['code']}</td>"
+        f"<tr><td style='padding:5px 8px'>{s.get('name','')}</td>"
+        f"<td style='padding:5px 8px;color:#888;font-size:11px'>{s['code']}</td>"
         f"<td style='padding:5px 8px;text-align:right;color:#d63031;font-weight:500'>+{s['net_yi']}亿</td></tr>"
         for s in yc.get("top_moneyflow", [])[:6]
-    ) or "<tr><td colspan='2' style='padding:8px;text-align:center;color:#aaa'>暂无</td></tr>"
+    ) or "<tr><td colspan='3' style='padding:8px;text-align:center;color:#aaa'>暂无</td></tr>"
 
     # 今日新闻
     news_items = "".join(
@@ -999,7 +1007,7 @@ def build_morning_html(title, ai_report, news_data, announcements, yest_capital)
     <!-- 今日新闻 -->
     <div style="margin-bottom:20px">
       <div style="font-size:13px;font-weight:500;color:#2d3436;margin-bottom:8px">
-        今日政策新闻快讯（{TODAY_CN}）
+        今日财经新闻快讯（{TODAY_CN}）
       </div>
       <table style="width:100%;border-collapse:collapse;font-size:12px">
         <thead><tr style="background:#f8f9fa;color:#888">
