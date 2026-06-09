@@ -358,6 +358,7 @@ def get_yesterday_capital() -> dict:
     elif yesterday.weekday() == 5:  # 周六则取周五
         yesterday = _bj - datetime.timedelta(days=2)
     ydate = yesterday.strftime("%Y%m%d")
+    names_map = get_stock_names()  # 代码 -> (名称, 行业)，龙虎榜与主力共用
 
     try:
         # 昨日龙虎榜
@@ -370,7 +371,11 @@ def get_yesterday_capital() -> dict:
                     row = df_list[df_list["ts_code"] == code]
                     if len(row) > 0:
                         name = row["name"].values[0]
-                result["dragon_tiger"].append({"code": code, "name": name})
+                result["dragon_tiger"].append({
+                    "code": code,
+                    "name": name,
+                    "industry": names_map.get(code, ("", ""))[1],
+                })
         print(f"  昨日龙虎榜机构：{len(result['dragon_tiger'])}只")
     except Exception as e:
         print(f"  昨日龙虎榜失败: {e}")
@@ -386,7 +391,6 @@ def get_yesterday_capital() -> dict:
                 pd.to_numeric(df["sell_elg_amount"], errors="coerce").fillna(0) -
                 pd.to_numeric(df["sell_lg_amount"],  errors="coerce").fillna(0)
             )
-            names_map = get_stock_names()
             for _, row in df.nlargest(8, "big_net").iterrows():
                 net = safe_float(row.get("big_net", 0))
                 if net > 0:
@@ -394,6 +398,7 @@ def get_yesterday_capital() -> dict:
                     result["top_moneyflow"].append({
                         "code":    code,
                         "name":    names_map.get(code, ("", ""))[0],
+                        "industry": names_map.get(code, ("", ""))[1],
                         "net_yi":  round(net / 1e4, 2),  # moneyflow金额单位万元，÷1e4得亿
                     })
         print(f"  昨日主力净流入：{len(result['top_moneyflow'])}只")
@@ -899,9 +904,9 @@ def ai_morning_report(news_data, announcements, yest_capital) -> str:
 
     # 昨日资金背景
     yc = yest_capital
-    dt_names  = "、".join(f"{s['name']}" for s in yc.get("dragon_tiger",[])[:5]) or "暂无"
+    dt_names  = "、".join(f"{s['name']}（{s.get('industry','')}）" for s in yc.get("dragon_tiger",[])[:5]) or "暂无"
     mf_text   = "、".join(
-        f"{s.get('name','')}({s['code']},+{s['net_yi']}亿)" for s in yc.get("top_moneyflow",[])[:5]
+        f"{s.get('name','')}({s['code']}，{s.get('industry','')}，+{s['net_yi']}亿)" for s in yc.get("top_moneyflow",[])[:5]
     ) or "暂无"
     ydate_str = (_bj - datetime.timedelta(days=1)).strftime("%m月%d日")
 
@@ -947,14 +952,14 @@ def build_morning_html(title, ai_report, news_data, announcements, yest_capital)
 
     # 昨日龙虎榜
     dt_rows = "".join(
-        f"<tr><td style='padding:5px 8px'>{s['name']}</td>"
+        f"<tr><td style='padding:5px 8px'>{s['name']} <span style='color:#aaa;font-size:10px'>{s.get('industry','')}</span></td>"
         f"<td style='padding:5px 8px;color:#888;font-size:11px'>{s['code']}</td></tr>"
         for s in yc.get("dragon_tiger", [])[:6]
     ) or "<tr><td colspan='2' style='padding:8px;text-align:center;color:#aaa'>暂无</td></tr>"
 
     # 昨日主力资金
     mf_rows = "".join(
-        f"<tr><td style='padding:5px 8px'>{s.get('name','')}</td>"
+        f"<tr><td style='padding:5px 8px'>{s.get('name','')} <span style='color:#aaa;font-size:10px'>{s.get('industry','')}</span></td>"
         f"<td style='padding:5px 8px;color:#888;font-size:11px'>{s['code']}</td>"
         f"<td style='padding:5px 8px;text-align:right;color:#d63031;font-weight:500'>+{s['net_yi']}亿</td></tr>"
         for s in yc.get("top_moneyflow", [])[:6]
@@ -1070,7 +1075,7 @@ def ai_closing_report(policy_news, stocks, market_sentiment,
     ) if ms.get("up", 0) > 0 else "今日收盘数据未入库"
 
     mf_text = "\n".join(
-        f"- {s.get('name','')}（{s['code']}）：大单净流入{s['net_flow_yi']}亿"
+        f"- {s.get('name','')}（{s['code']}，{s.get('industry','')}）：大单净流入{s['net_flow_yi']}亿"
         for s in moneyflow[:8]
     ) or "暂无"
 
@@ -1288,14 +1293,15 @@ def build_closing_html(title, ai_report, stocks, market_sentiment,
 
     mf_rows = "".join(
         f"<tr><td style='padding:5px 8px'>{s.get('name','')}</td>"
+        f"<td style='padding:5px 8px;color:#666;font-size:11px'>{s.get('industry','')}</td>"
         f"<td style='padding:5px 8px;color:#888;font-size:11px'>{s['code']}</td>"
         f"<td style='padding:5px 8px;text-align:right;color:#d63031;font-weight:500'>+{s['net_flow_yi']}亿</td></tr>"
         for s in moneyflow[:10]
-    ) or "<tr><td colspan='3' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>暂无</td></tr>"
+    ) or "<tr><td colspan='4' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>暂无</td></tr>"
 
     dt_rows = "".join(
         f"<tr><td style='padding:5px 8px'>{s['name']}</td>"
-        f"<td style='padding:5px 8px;color:#6c5ce7;font-size:11px'>{s['signal']}</td></tr>"
+        f"<td style='padding:5px 8px;color:#666;font-size:11px'>{s.get('industry','')}</td></tr>"
         for s in dragon_tiger[:5]
     ) or "<tr><td colspan='2' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>暂无</td></tr>"
 
@@ -1364,6 +1370,7 @@ def build_closing_html(title, ai_report, stocks, market_sentiment,
     <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:20px">
       <thead><tr style="background:#f8f9fa;color:#888">
         <th style="padding:5px 8px;text-align:left;font-weight:400">名称</th>
+        <th style="padding:5px 8px;text-align:left;font-weight:400">行业</th>
         <th style="padding:5px 8px;text-align:left;font-weight:400">代码</th>
         <th style="padding:5px 8px;text-align:right;font-weight:400">净流入</th>
       </tr></thead>
@@ -1607,9 +1614,12 @@ def main():
         factor_df   = get_stk_factor()
         northbound  = {"total": 0, "top_stocks": []}  # 北向实时/净流入数据自2024年起已停止披露，模块移除
         moneyflow   = get_moneyflow()
-        for _m in moneyflow:                       # 补股票名称（names: code -> (name, industry)）
-            _m["name"] = names.get(_m["code"], ("", ""))[0]
+        for _m in moneyflow:                       # 补名称+行业（names: code -> (name, industry)）
+            _info = names.get(_m["code"], ("", ""))
+            _m["name"], _m["industry"] = _info[0], _info[1]
         dragon_tiger= get_dragon_tiger()
+        for _d in dragon_tiger:                     # 补行业
+            _d["industry"] = names.get(_d["code"], ("", ""))[1]
         block_trade = get_block_trade()
         sector_flow = get_sector_flow()
         broker_rec  = []  # 券商金股与本系统中小盘动量逻辑不符，且为月度静态共识，移除
