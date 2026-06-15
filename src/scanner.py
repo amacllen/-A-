@@ -52,7 +52,10 @@ IS_WEEKEND = WEEKDAY >= 5
 # 11:35北京 = UTC 03:35  → 上午快报
 # 18:00北京 = UTC 10:00  → 收盘深度
 # 18:30北京 = UTC 10:30  → 财报专项（周五）
-if NOW_H == 3 and NOW_M >= 30:
+if IS_WEEKEND:
+    # 周末：A股休市，无论触发时间一律走周报模式
+    MODE = "weekly"
+elif NOW_H == 3 and NOW_M >= 30:
     MODE = "morning"
 elif NOW_H == 10 and NOW_M < 20:
     MODE = "closing"
@@ -110,6 +113,41 @@ def safe_float(val, default=0.0):
         return float(val) if val is not None and str(val) not in ["", "nan", "None"] else default
     except:
         return default
+
+
+# ───────── 交易日工具 ─────────
+def get_trade_dates_in_week(end_date=None) -> list:
+    """
+    返回截至end_date(含)所在自然周的所有A股交易日 YYYYMMDD 列表（升序）。
+    end_date为空时取今天；周末调用得到周一→周五的实际交易日。
+    """
+    end_dt = _bj if end_date is None else datetime.datetime.strptime(end_date, "%Y%m%d")
+    monday = end_dt - datetime.timedelta(days=end_dt.weekday())
+    sunday = monday + datetime.timedelta(days=6)
+    try:
+        cal = pro.trade_cal(
+            exchange="",
+            start_date=monday.strftime("%Y%m%d"),
+            end_date=sunday.strftime("%Y%m%d"),
+            is_open="1",
+        )
+        if cal is not None and len(cal) > 0:
+            return sorted(cal["cal_date"].tolist())
+    except Exception as e:
+        print(f"  trade_cal失败: {e}")
+    return []
+
+
+def get_last_trade_date() -> str:
+    """返回最近一个已收盘的交易日YYYYMMDD（周末/今日未开盘时回退）。"""
+    try:
+        start = (_bj - datetime.timedelta(days=10)).strftime("%Y%m%d")
+        cal = pro.trade_cal(exchange="", start_date=start, end_date=TODAY, is_open="1")
+        if cal is not None and len(cal) > 0:
+            return sorted(cal["cal_date"].tolist())[-1]
+    except Exception as e:
+        print(f"  最近交易日查询失败: {e}")
+    return TODAY
 
 
 def ask_deepseek(prompt: str, max_tokens: int = 2500) -> str:
@@ -179,35 +217,9 @@ def fetch_policy_news() -> list:
     if not news_fetched:
         print("  今日政策新闻：Tushare暂无数据")
 
-    # 2. Tushare国家政策库（大模型语料专题，每日更新）
-    try:
-        df_policy = pro.ncov_num(trade_date=today_ts)  # 尝试当日政策
-    except Exception:
-        df_policy = None
-
-    # 跳过额外政策接口，news已经涵盖
-
-    # 3. 新华社RSS（严格今日过滤）
-    for url in [
-        "http://www.xinhuanet.com/politics/news_politics.xml",
-        "http://www.xinhuanet.com/fortune/news_fortune.xml",
-    ]:
-        try:
-            resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200:
-                continue
-            root = ElementTree.fromstring(resp.content)
-            for item in root.iter("item"):
-                title    = item.findtext("title", "")
-                pub_date = item.findtext("pubDate", "")
-                # 严格验证是今天：格式 Mon, 08 Jun 2026 或含今日年月日
-                day_str  = _bj.strftime("%d %b %Y")   # "08 Jun 2026"
-                if pub_date and today_str not in pub_date and day_str not in pub_date:
-                    continue
-                if any(k in title for k in POLICY_KEYWORDS):
-                    result.append(f"[新华社] {title[:150]}")
-        except Exception as e:
-            print(f"  新华社RSS失败: {e}")
+    # 注：原新华社RSS(xinhuanet.com/*.xml)已移除——该端点常年返回缓存旧内容、
+    # 且多数条目无pubDate绕过日期过滤，导致历史政策新闻(如COP15、公祭日等)漏入。
+    # 政策新闻仅保留上方有可靠日期过滤的Tushare CLS快讯，无匹配时如实显示"今日暂无"。
 
     # 去重
     seen, deduped = set(), []
@@ -413,16 +425,17 @@ def get_yesterday_capital() -> dict:
 #  模块三：收盘Tushare全量数据
 # ══════════════════════════════════════════════════════════
 
-def get_daily_data() -> tuple:
+def get_daily_data(date=None) -> tuple:
     """收盘行情 + 基础指标"""
-    print("【行情】收盘数据...")
+    d = date or TODAY
+    print(f"【行情】收盘数据 {d}...")
     try:
         price = pro.daily(
-            trade_date=TODAY,
+            trade_date=d,
             fields="ts_code,open,high,low,close,pre_close,change,pct_chg,vol,amount"
         )
         basic = pro.daily_basic(
-            trade_date=TODAY,
+            trade_date=d,
             fields="ts_code,close,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv,pct_chg"
         )
         price_ok = price is not None and isinstance(price, pd.DataFrame) and not price.empty
@@ -447,12 +460,13 @@ def get_stock_names() -> dict:
     return {}
 
 
-def get_stk_factor() -> pd.DataFrame:
+def get_stk_factor(date=None) -> pd.DataFrame:
     """批量技术因子（6000积分）"""
-    print("【技术因子】批量获取...")
+    d = date or TODAY
+    print(f"【技术因子】批量获取 {d}...")
     try:
         df = pro.stk_factor(
-            trade_date=TODAY,
+            trade_date=d,
             fields="ts_code,close,ma5,ma10,ma20,ma60,dif,dea,macd,kdj_k,kdj_d,kdj_j,rsi_6,rsi_12,boll_upper,boll_mid,boll_lower,volume_ratio"
         )
         if df is not None and len(df) > 0:
@@ -602,6 +616,169 @@ def get_broker_recommend() -> list:
     except Exception as e:
         print(f"  券商金股失败: {e}")
     return result[:6]
+
+
+# ══════════════════════════════════════════════════════════
+#  模块：周报数据（周末模式）
+# ══════════════════════════════════════════════════════════
+
+def get_weekly_index_perf(week_dates: list) -> list:
+    """本周主要指数涨跌幅。week_dates为本周交易日升序列表。"""
+    if not week_dates:
+        return []
+    start_d, end_d = week_dates[0], week_dates[-1]
+    indices = [
+        ("000001.SH", "上证指数"),
+        ("399001.SZ", "深证成指"),
+        ("399006.SZ", "创业板指"),
+        ("000688.SH", "科创50"),
+        ("000300.SH", "沪深300"),
+        ("000905.SH", "中证500"),
+    ]
+    out = []
+    for code, name in indices:
+        try:
+            df = pro.index_daily(ts_code=code, start_date=start_d, end_date=end_d,
+                                 fields="trade_date,close,pct_chg")
+            if df is None or len(df) == 0:
+                continue
+            df = df.sort_values("trade_date")
+            open_close = safe_float(df.iloc[0]["close"]) - safe_float(df.iloc[0]["pct_chg"]) * 0  # 占位
+            first_close = safe_float(df.iloc[0]["close"])
+            last_close  = safe_float(df.iloc[-1]["close"])
+            # 周涨跌幅 = 各日pct_chg复合
+            cum = 1.0
+            for _, r in df.iterrows():
+                cum *= (1 + safe_float(r["pct_chg"]) / 100)
+            week_chg = round((cum - 1) * 100, 2)
+            out.append({
+                "code": code, "name": name,
+                "close": round(last_close, 2),
+                "week_chg": week_chg,
+                "days": len(df),
+            })
+        except Exception as e:
+            print(f"  指数{code}失败: {e}")
+    print(f"  本周指数：{len(out)}个")
+    return out
+
+
+def get_weekly_sector_flow(week_dates: list) -> dict:
+    """本周行业资金累计净流入（亿元）。返回 {流入TOP, 流出TOP}。"""
+    if not week_dates:
+        return {"inflow": [], "outflow": []}
+    agg = {}
+    for d in week_dates:
+        try:
+            df = pro.moneyflow_ind_ths(trade_date=d)
+            if df is None or len(df) == 0:
+                continue
+            for _, row in df.iterrows():
+                ind = row.get("industry", "")
+                if not ind:
+                    continue
+                # moneyflow_ind_ths net_amount 单位已是亿元
+                agg[ind] = agg.get(ind, 0.0) + safe_float(row.get("net_amount", 0))
+        except Exception as e:
+            print(f"  {d}行业资金失败: {e}")
+    items = sorted(agg.items(), key=lambda x: x[1], reverse=True)
+    inflow  = [{"sector": s, "net_yi": round(v, 2)} for s, v in items[:8]  if v > 0]
+    outflow = [{"sector": s, "net_yi": round(v, 2)} for s, v in items[-8:] if v < 0]
+    outflow.reverse()  # 流出最大在前
+    print(f"  本周行业资金：流入{len(inflow)} / 流出{len(outflow)}")
+    return {"inflow": inflow, "outflow": outflow}
+
+
+def get_weekly_top_stocks(week_dates: list, names_map: dict) -> list:
+    """本周个股累计涨跌幅TOP（按区间首日开盘到末日收盘）。过滤ST/北交所。"""
+    if len(week_dates) < 2:
+        return []
+    start_d, end_d = week_dates[0], week_dates[-1]
+    try:
+        df_start = pro.daily(trade_date=start_d, fields="ts_code,pre_close,open")
+        df_end   = pro.daily(trade_date=end_d,   fields="ts_code,close")
+        if df_start is None or df_end is None or df_start.empty or df_end.empty:
+            return []
+        df = df_start.merge(df_end, on="ts_code", suffixes=("_s", "_e"))
+        df["pre_close"] = pd.to_numeric(df["pre_close"], errors="coerce")
+        df["close"]     = pd.to_numeric(df["close"],     errors="coerce")
+        df = df.dropna(subset=["pre_close", "close"])
+        df = df[df["pre_close"] > 0]
+        df["week_pct"] = (df["close"] / df["pre_close"] - 1) * 100
+        # 过滤北交所
+        df = df[~df["ts_code"].str.endswith(".BJ")]
+        df = df.sort_values("week_pct", ascending=False)
+        out = []
+        for _, r in df.head(40).iterrows():
+            code = r["ts_code"]
+            name, industry = names_map.get(code, ("", ""))
+            if not name:
+                continue
+            if name.startswith("ST") or name.startswith("*ST") or "退" in name:
+                continue
+            out.append({
+                "code": code, "name": name, "industry": industry,
+                "week_pct": round(r["week_pct"], 2),
+            })
+            if len(out) >= 15:
+                break
+        print(f"  本周强势个股：{len(out)}只")
+        return out
+    except Exception as e:
+        print(f"  本周强势个股失败: {e}")
+        return []
+
+
+def get_weekly_news() -> list:
+    """
+    本周(周一→今天)CLS新闻汇总，按关键词筛出重大政策/事件/影响大盘的新闻。
+    返回 [{date, time, title}]，已去重。
+    """
+    keywords = [
+        # 货币/财政/监管
+        "央行", "降准", "降息", "MLF", "LPR", "逆回购", "国常会", "国务院", "政治局",
+        "证监会", "国资委", "财政部", "发改委", "工信部",
+        # 大盘催化
+        "A股", "沪深", "万亿", "新高", "暴跌", "暴涨", "熔断",
+        # 产业政策
+        "AI", "人工智能", "半导体", "芯片", "新能源", "光伏", "储能", "机器人",
+        "军工", "国防", "稀土", "数据要素", "算力",
+        # 国际/宏观
+        "关税", "贸易", "美联储", "加息", "降息", "特朗普", "拜登",
+        # 重大事件
+        "IPO", "退市", "重组", "停牌", "复牌", "破发",
+    ]
+    monday = (_bj - datetime.timedelta(days=_bj.weekday())).strftime("%Y-%m-%d")
+    today_str = _bj.strftime("%Y-%m-%d")
+    print(f"【本周新闻】{monday} → {today_str}")
+    try:
+        df = pro.news(src="cls",
+                      start_date=monday + " 00:00:00",
+                      end_date=today_str + " 23:59:59",
+                      fields="datetime,title")
+        if df is None or len(df) == 0:
+            return []
+        seen, out = set(), []
+        for _, row in df.iterrows():
+            title = str(row.get("title", "")).strip()
+            if len(title) < 8 or title in seen:
+                continue
+            if not any(k in title for k in keywords):
+                continue
+            seen.add(title)
+            dt = str(row.get("datetime", ""))
+            out.append({
+                "date": dt[:10],
+                "time": dt[11:16],
+                "title": title[:120],
+            })
+        # 按时间倒序展示，最多40条
+        out.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
+        print(f"  本周重要新闻：{len(out)}条（截断展示40条）")
+        return out[:40]
+    except Exception as e:
+        print(f"  本周新闻失败: {e}")
+        return []
 
 
 def quant_and_tech_filter(price_df, basic_df, names, factor_df) -> list:
@@ -1260,6 +1437,214 @@ def ai_financial_report(financial_data, industry_trend, policy_news,
     return ask_deepseek(prompt, max_tokens=3000)
 
 
+# ══════════════════════════════════════════════════════════
+#  周报 AI + HTML
+# ══════════════════════════════════════════════════════════
+
+def ai_weekly_review(week_dates, idx_perf, sector_flow_week,
+                     top_stocks, weekly_news, stocks_friday) -> str:
+    """周度复盘：基于本周真实数据生成AI综述。"""
+    if not week_dates:
+        return "本周无交易日数据，无法生成周度复盘。"
+
+    period = f"{week_dates[0]} → {week_dates[-1]}（共{len(week_dates)}个交易日）"
+
+    idx_text = "\n".join(
+        f"- {x['name']}（{x['code']}）：周涨跌 {x['week_chg']:+.2f}%，收 {x['close']}"
+        for x in idx_perf
+    ) or "暂无"
+
+    inflow_text = "\n".join(
+        f"- {x['sector']}：+{x['net_yi']}亿" for x in sector_flow_week["inflow"]
+    ) or "暂无"
+    outflow_text = "\n".join(
+        f"- {x['sector']}：{x['net_yi']}亿" for x in sector_flow_week["outflow"]
+    ) or "暂无"
+
+    top_text = "\n".join(
+        f"- {x['name']}（{x['code']}，{x['industry']}）：+{x['week_pct']}%"
+        for x in top_stocks[:10]
+    ) or "暂无"
+
+    news_text = "\n".join(
+        f"{i+1}. [{n['date']} {n['time']}] {n['title']}"
+        for i, n in enumerate(weekly_news[:25])
+    ) or "本周无重大政策/事件新闻"
+
+    pick_text = "\n".join(
+        f"- {s.get('name','')}（{s.get('code','')}，{s.get('industry','')}）评分{s.get('score','')}/12"
+        for s in (stocks_friday or [])[:10]
+    ) or "周五技术面精筛无符合条件标的"
+
+    prompt = f"""本周A股市场周度复盘（{period}）。
+基于以下真实数据，撰写一份结构化周报。要求：只引用下方数据，不得编造、不得引用列表外的事件；用平实中文，不用比喻。
+
+【本周指数走势】
+{idx_text}
+
+【本周行业资金流入TOP】
+{inflow_text}
+
+【本周行业资金流出TOP】
+{outflow_text}
+
+【本周强势个股TOP10】
+{top_text}
+
+【本周重大政策/事件/新闻（编号列表）】
+{news_text}
+
+【周五技术面精筛标的】
+{pick_text}
+
+请按以下五部分输出：
+
+**一、本周市场总览**
+用2-3句话点出本周大盘强弱、风格分化（大小盘/成长价值/行业）、量能特征。引用指数涨跌幅。
+
+**二、本周资金主线**
+基于行业资金流入/流出数据，指出本周资金最集中的方向、被抛弃的方向，以及对应的逻辑判断。
+
+**三、本周重大政策/事件回顾**
+从上述编号新闻中挑选3-5条对大盘或行业影响最大的，逐条说明其市场含义。不得引用列表外的新闻。
+
+**四、下周关注方向**
+结合本周资金主线 + 政策催化 + 技术面精筛，给出2-3个值得跟踪的方向（板块层面，不是个股推荐）。
+
+**五、下周可重点跟踪的个股**
+仅从【周五技术面精筛标的】中选取，必须说明数据依据。若为空则写"周五技术面无符合条件标的，下周观察精筛结果"。不得推荐券商金股、大盘权重股。
+"""
+    print("  AI周度复盘...")
+    return ask_deepseek(prompt, max_tokens=3000)
+
+
+def build_weekly_html(title, ai_report, week_dates, idx_perf,
+                      sector_flow_week, top_stocks, weekly_news, stocks_friday) -> str:
+    period = f"{week_dates[0]} → {week_dates[-1]}" if week_dates else "—"
+
+    idx_rows = "".join(
+        f"<tr><td style='padding:5px 8px'>{x['name']}</td>"
+        f"<td style='padding:5px 8px;color:#888;font-size:11px'>{x['code']}</td>"
+        f"<td style='padding:5px 8px;text-align:right;color:{'#d63031' if x['week_chg']>=0 else '#00b894'};font-weight:500'>"
+        f"{x['week_chg']:+.2f}%</td></tr>"
+        for x in idx_perf
+    ) or "<tr><td colspan='3' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>暂无</td></tr>"
+
+    inflow_rows = "".join(
+        f"<tr><td style='padding:5px 8px'>{x['sector']}</td>"
+        f"<td style='padding:5px 8px;text-align:right;color:#d63031;font-weight:500'>+{x['net_yi']}亿</td></tr>"
+        for x in sector_flow_week["inflow"]
+    ) or "<tr><td colspan='2' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>暂无</td></tr>"
+
+    outflow_rows = "".join(
+        f"<tr><td style='padding:5px 8px'>{x['sector']}</td>"
+        f"<td style='padding:5px 8px;text-align:right;color:#00b894;font-weight:500'>{x['net_yi']}亿</td></tr>"
+        for x in sector_flow_week["outflow"]
+    ) or "<tr><td colspan='2' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>暂无</td></tr>"
+
+    top_rows = "".join(
+        f"<tr><td style='padding:5px 8px'>{x['name']}</td>"
+        f"<td style='padding:5px 8px;color:#666;font-size:11px'>{x['industry']}</td>"
+        f"<td style='padding:5px 8px;color:#888;font-size:11px'>{x['code']}</td>"
+        f"<td style='padding:5px 8px;text-align:right;color:#d63031;font-weight:500'>+{x['week_pct']}%</td></tr>"
+        for x in top_stocks[:15]
+    ) or "<tr><td colspan='4' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>暂无</td></tr>"
+
+    news_rows = "".join(
+        f"<tr><td style='padding:5px 8px;color:#888;font-size:11px;white-space:nowrap'>{n['date']} {n['time']}</td>"
+        f"<td style='padding:5px 8px'>{n['title']}</td></tr>"
+        for n in weekly_news[:40]
+    ) or "<tr><td colspan='2' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>本周无重大政策/事件新闻</td></tr>"
+
+    # 周五技术面精筛
+    pick_rows = "".join(
+        f"<tr><td style='padding:5px 8px'>{s.get('name','')}</td>"
+        f"<td style='padding:5px 8px;color:#666;font-size:11px'>{s.get('industry','')}</td>"
+        f"<td style='padding:5px 8px;color:#888;font-size:11px'>{s.get('code','')}</td>"
+        f"<td style='padding:5px 8px;text-align:right'>{s.get('pct_chg','')}%</td>"
+        f"<td style='padding:5px 8px;text-align:right;color:#6c5ce7;font-weight:500'>{s.get('score','')}/12</td></tr>"
+        for s in (stocks_friday or [])[:10]
+    ) or "<tr><td colspan='5' style='padding:8px;text-align:center;color:#aaa;font-size:11px'>周五技术面无符合条件标的</td></tr>"
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>{title}</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;background:#f5f5f7;margin:0;padding:20px;color:#2d3436">
+<div style="max-width:780px;margin:auto">
+
+  <div style="background:linear-gradient(135deg,#6c5ce7 0%,#a29bfe 100%);color:#fff;padding:20px;border-radius:12px;margin-bottom:16px">
+    <div style="font-size:18px;font-weight:600">{title}</div>
+    <div style="font-size:11px;opacity:0.85;margin-top:3px">{period} · 周度复盘 · v7.0 · Tushare Pro 6000积分</div>
+  </div>
+
+  <div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+    <div style="font-size:13px;font-weight:500;color:#6c5ce7;margin-bottom:10px">AI 周度复盘</div>
+    <div style="color:#2d3436;line-height:1.9;font-size:13px">{md_to_html(ai_report)}</div>
+  </div>
+
+  <div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+    <div style="font-size:13px;font-weight:500;color:#2d3436;margin-bottom:10px">本周指数走势</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="background:#f8f9fa;color:#888">
+        <th style="padding:5px 8px;text-align:left;font-weight:400">指数</th>
+        <th style="padding:5px 8px;text-align:left;font-weight:400">代码</th>
+        <th style="padding:5px 8px;text-align:right;font-weight:400">周涨跌</th>
+      </tr></thead>
+      <tbody>{idx_rows}</tbody>
+    </table>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+    <div style="background:#fff;padding:18px;border-radius:12px">
+      <div style="font-size:13px;font-weight:500;color:#d63031;margin-bottom:10px">本周资金流入板块</div>
+      <table style="width:100%;font-size:12px">{inflow_rows}</table>
+    </div>
+    <div style="background:#fff;padding:18px;border-radius:12px">
+      <div style="font-size:13px;font-weight:500;color:#00b894;margin-bottom:10px">本周资金流出板块</div>
+      <table style="width:100%;font-size:12px">{outflow_rows}</table>
+    </div>
+  </div>
+
+  <div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+    <div style="font-size:13px;font-weight:500;color:#2d3436;margin-bottom:10px">本周强势个股 TOP15</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="background:#f8f9fa;color:#888">
+        <th style="padding:5px 8px;text-align:left;font-weight:400">名称</th>
+        <th style="padding:5px 8px;text-align:left;font-weight:400">行业</th>
+        <th style="padding:5px 8px;text-align:left;font-weight:400">代码</th>
+        <th style="padding:5px 8px;text-align:right;font-weight:400">周涨幅</th>
+      </tr></thead>
+      <tbody>{top_rows}</tbody>
+    </table>
+  </div>
+
+  <div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+    <div style="font-size:13px;font-weight:500;color:#2d3436;margin-bottom:10px">本周重大政策 / 事件 / 新闻回顾</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <tbody>{news_rows}</tbody>
+    </table>
+  </div>
+
+  <div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+    <div style="font-size:13px;font-weight:500;color:#2d3436;margin-bottom:10px">周五技术面精筛标的（评分≥5/12）</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="background:#f8f9fa;color:#888">
+        <th style="padding:5px 8px;text-align:left;font-weight:400">名称</th>
+        <th style="padding:5px 8px;text-align:left;font-weight:400">行业</th>
+        <th style="padding:5px 8px;text-align:left;font-weight:400">代码</th>
+        <th style="padding:5px 8px;text-align:right;font-weight:400">涨幅</th>
+        <th style="padding:5px 8px;text-align:right;font-weight:400">评分</th>
+      </tr></thead>
+      <tbody>{pick_rows}</tbody>
+    </table>
+  </div>
+
+  <div style="text-align:center;color:#aaa;font-size:11px;margin-top:14px">
+    本报告由AI自动生成，数据源：Tushare Pro 6000积分，不构成投资建议。投资有风险，决策需谨慎。
+  </div>
+
+</div></body></html>"""
+
+
 def build_closing_html(title, ai_report, stocks, market_sentiment,
                         northbound, moneyflow, dragon_tiger,
                         block_trade, sector_flow, broker_rec) -> str:
@@ -1590,6 +1975,42 @@ def main():
         html      = build_morning_html(subject, ai_report, news_data, announcements, yest_capital)
         send_email(subject, html)
         save_report(html, "上午快报")
+
+    elif MODE == "weekly":
+        # ══ 周末周报 ══
+        print("\n=== 周末周报模式 ===")
+        week_dates = get_trade_dates_in_week()
+        if not week_dates:
+            print("  本周无交易日，跳过")
+            return
+        friday = week_dates[-1]
+        names       = get_stock_names()
+
+        # 1. 指数走势
+        idx_perf        = get_weekly_index_perf(week_dates)
+        # 2. 行业资金累计
+        sector_flow_week= get_weekly_sector_flow(week_dates)
+        # 3. 强势个股
+        top_stocks      = get_weekly_top_stocks(week_dates, names)
+        # 4. 周五技术面精筛
+        price_df, basic_df = get_daily_data(friday)
+        factor_df          = get_stk_factor(friday)
+        stocks_friday      = quant_and_tech_filter(price_df, basic_df, names, factor_df)
+        # 5. 本周重大新闻
+        weekly_news        = get_weekly_news()
+
+        # 6. AI 周度复盘
+        ai_report = ai_weekly_review(
+            week_dates, idx_perf, sector_flow_week,
+            top_stocks, weekly_news, stocks_friday
+        )
+        subject = f"【A股周报】{TODAY_CN} · 本周复盘 ({week_dates[0]}→{week_dates[-1]})"
+        html    = build_weekly_html(
+            subject, ai_report, week_dates, idx_perf,
+            sector_flow_week, top_stocks, weekly_news, stocks_friday
+        )
+        send_email(subject, html)
+        save_report(html, "周报")
 
     elif MODE == "financial" and IS_EARNINGS and WEEKDAY == 4:
         # ══ 财报专项（周五，财报季内）══
