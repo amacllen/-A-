@@ -12,6 +12,7 @@ import re
 import datetime
 import time
 import smtplib
+import sqlite3
 import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -882,6 +883,690 @@ def quant_and_tech_filter(price_df, basic_df, names, factor_df) -> list:
     except Exception as e:
         print(f"  筛选失败: {e}")
         return []
+
+
+# ══════════════════════════════════════════════════════════
+#  B轨「潜伏标的」：政策×行业×资金×筹码×形态 综合打分
+# ══════════════════════════════════════════════════════════
+
+# 政策关键词清单（来源：政府工作报告、二十届三中全会、十四五规划、国常会议题、
+# 战略性新兴产业目录）。可随时增删，不需改其他代码。
+POLICY_KEYWORDS = [
+    # 新质生产力 / AI / 算力
+    "新质生产力", "人工智能", "大模型", "算力", "数据中心", "数据要素", "大数据",
+    # 半导体
+    "半导体", "集成电路", "芯片", "EDA", "第三代半导体", "先进封装", "光刻",
+    # 机器人 / 智能驾驶
+    "机器人", "人形机器人", "工业机器人", "具身智能", "自动驾驶", "智能驾驶",
+    # 低空经济 / 商业航天
+    "低空经济", "通用航空", "eVTOL", "无人机", "商业航天", "卫星互联网", "北斗",
+    # 新能源
+    "新能源", "储能", "固态电池", "钠离子电池", "光伏", "风电", "氢能", "燃料电池",
+    # 军工
+    "军工", "国防", "核工业", "海工装备", "航天装备", "导弹", "雷达",
+    # 前沿科技
+    "可控核聚变", "量子科技", "量子通信", "量子计算", "6G", "脑机接口",
+    # 医药
+    "创新药", "合成生物", "基因治疗", "医疗器械", "中医药", "脑科学",
+    # 高端制造
+    "高端制造", "工业母机", "数控机床", "工业软件", "智能制造", "数字孪生",
+    # 新材料
+    "新材料", "稀土", "钨", "钼", "锑", "高温合金", "碳纤维", "石墨烯",
+    # 国企改革
+    "国企改革", "中特估", "央企",
+]
+
+# 公认的"机构席位"关键词，用于识别十大流通股东里的机构持仓
+INSTITUTIONAL_KEYWORDS = ["基金", "社保", "保险", "QFII", "证券", "信托", "养老",
+                          "资管", "汇金", "中央汇金", "证金"]
+
+# SQLite缓存文件路径
+CACHE_DB = os.environ.get("CACHE_DB_PATH", "/tmp/scanner_cache.db")
+
+
+# ───────── SQLite 缓存层 ─────────
+def _init_cache_db():
+    """初始化缓存数据库（首次运行时创建表）"""
+    conn = sqlite3.connect(CACHE_DB)
+    c = conn.cursor()
+    # 日线缓存：(代码, 日期) 唯一
+    c.execute("""CREATE TABLE IF NOT EXISTS daily_cache (
+        ts_code TEXT, trade_date TEXT, close REAL, vol REAL, amount REAL,
+        pct_chg REAL, high REAL, low REAL,
+        PRIMARY KEY (ts_code, trade_date)
+    )""")
+    # 季度数据缓存：股东户数 / 财务 / 十大流通股东 都用这个
+    c.execute("""CREATE TABLE IF NOT EXISTS quarterly_cache (
+        ts_code TEXT, dtype TEXT, end_date TEXT, payload TEXT,
+        fetched_at TEXT,
+        PRIMARY KEY (ts_code, dtype, end_date)
+    )""")
+    # 大股东增减持缓存（90天滚动）
+    c.execute("""CREATE TABLE IF NOT EXISTS holder_trade_cache (
+        ts_code TEXT PRIMARY KEY, net_change REAL, fetched_at TEXT
+    )""")
+    # 元数据：记录"上次冷启动"等
+    c.execute("""CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY, value TEXT
+    )""")
+    conn.commit()
+    return conn
+
+
+def _get_cached_daily(conn, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """从SQLite读历史日线"""
+    q = """SELECT ts_code,trade_date,close,vol,amount,pct_chg,high,low
+           FROM daily_cache WHERE ts_code=? AND trade_date>=? AND trade_date<=?
+           ORDER BY trade_date"""
+    return pd.read_sql_query(q, conn, params=(ts_code, start_date, end_date))
+
+
+def _save_daily(conn, df: pd.DataFrame):
+    """写入日线数据"""
+    if df is None or df.empty:
+        return
+    rows = [(r["ts_code"], r["trade_date"],
+             safe_float(r.get("close")), safe_float(r.get("vol")),
+             safe_float(r.get("amount")), safe_float(r.get("pct_chg")),
+             safe_float(r.get("high")), safe_float(r.get("low")))
+            for _, r in df.iterrows()]
+    conn.executemany("""INSERT OR REPLACE INTO daily_cache
+        (ts_code,trade_date,close,vol,amount,pct_chg,high,low)
+        VALUES (?,?,?,?,?,?,?,?)""", rows)
+    conn.commit()
+
+
+def _ensure_daily_history(conn, candidates: list, end_date: str, lookback_days=250):
+    """
+    保证候选池每只股票都有 lookback_days 的历史日线缓存。
+    冷启动慢（按日逐天调daily取全市场），增量快（只补缺失日）。
+    """
+    start_dt = datetime.datetime.strptime(end_date, "%Y%m%d") - datetime.timedelta(days=int(lookback_days*1.6))
+    start_date = start_dt.strftime("%Y%m%d")
+
+    # 找出缓存里已有的最新交易日
+    c = conn.cursor()
+    c.execute("SELECT MAX(trade_date) FROM daily_cache")
+    row = c.fetchone()
+    cached_max = row[0] if row and row[0] else None
+
+    # 决定需要补的日期范围
+    if cached_max and cached_max >= start_date:
+        fetch_start = (datetime.datetime.strptime(cached_max, "%Y%m%d") + datetime.timedelta(days=1)).strftime("%Y%m%d")
+    else:
+        fetch_start = start_date
+
+    if fetch_start > end_date:
+        print(f"  日线缓存已就绪（最新{cached_max}）")
+        return
+
+    # 拿交易日历，逐日按 trade_date 拉全市场（高效，每次1个API调用就有5000+条）
+    try:
+        cal = pro.trade_cal(exchange="", start_date=fetch_start, end_date=end_date, is_open="1")
+        trade_dates = sorted(cal["cal_date"].tolist()) if cal is not None and len(cal) > 0 else []
+    except Exception as e:
+        print(f"  trade_cal失败: {e}")
+        return
+
+    # 冷启动保护：单次最多拉60个交易日，剩下交给后续运行慢慢补
+    # （这样首次执行不会超时，几次后历史就齐了）
+    if len(trade_dates) > 60:
+        print(f"  冷启动：检测到{len(trade_dates)}个交易日待拉取，本次只拉最近60天，剩余下次补")
+        trade_dates = trade_dates[-60:]
+
+    print(f"  日线缓存增量拉取：{trade_dates[0]} → {end_date}（共{len(trade_dates)}个交易日）")
+    for i, d in enumerate(trade_dates):
+        try:
+            df = pro.daily(trade_date=d,
+                           fields="ts_code,trade_date,close,vol,amount,pct_chg,high,low")
+            if df is not None and len(df) > 0:
+                _save_daily(conn, df)
+            if (i+1) % 20 == 0:
+                print(f"    进度 {i+1}/{len(trade_dates)}")
+            time.sleep(0.3)  # 控速，避免触发频次限制
+        except Exception as e:
+            print(f"    {d} 失败: {e}")
+            time.sleep(2)
+
+
+def _get_cached_quarterly(conn, ts_code: str, dtype: str, max_age_days=80):
+    """读取季度数据缓存。返回最新payload(JSON字符串)或None。"""
+    c = conn.cursor()
+    c.execute("""SELECT end_date, payload, fetched_at FROM quarterly_cache
+                 WHERE ts_code=? AND dtype=? ORDER BY end_date DESC LIMIT 4""",
+              (ts_code, dtype))
+    rows = c.fetchall()
+    if not rows:
+        return None
+    # 看最新一条是否还新鲜
+    latest = rows[0]
+    fetched = datetime.datetime.strptime(latest[2][:10], "%Y-%m-%d") if latest[2] else datetime.datetime(2000,1,1)
+    if (datetime.datetime.utcnow() - fetched).days > max_age_days:
+        return None
+    return rows  # 返回最多4个季度
+
+
+def _save_quarterly(conn, ts_code: str, dtype: str, end_date: str, payload: str):
+    conn.execute("""INSERT OR REPLACE INTO quarterly_cache
+        (ts_code,dtype,end_date,payload,fetched_at) VALUES (?,?,?,?,?)""",
+        (ts_code, dtype, end_date, payload,
+         datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+
+
+# ───────── B轨候选池准入筛选 ─────────
+def _eligible_candidates(price_df, basic_df, names_map) -> pd.DataFrame:
+    """
+    宽松准入：剔除绝对不要的（ST/北交所/次新/市值过小过大/流动性差）
+    其他全进打分模型，保证有票出。
+    """
+    if price_df.empty or basic_df.empty:
+        return pd.DataFrame()
+    df = pd.merge(basic_df, price_df[["ts_code","pct_chg","vol","amount","high","low"]],
+                  on="ts_code", how="inner", suffixes=("","_p"))
+    for col in ["circ_mv","turnover_rate","volume_ratio","pe","pct_chg","amount"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 市值 30-800 亿（circ_mv 单位万元：300000 - 8000000）
+    df = df[(df["circ_mv"] >= 300000) & (df["circ_mv"] <= 8000000)]
+    # 北交所排除
+    df = df[~df["ts_code"].str.endswith(".BJ")]
+    # 当日成交额 ≥ 5000 万（流动性兜底）
+    df = df[df["amount"].fillna(0) >= 5000]
+
+    # 通过 names_map 排除 ST/退市/次新
+    def _name_ok(code):
+        name = names_map.get(code, ("", ""))[0]
+        if not name:
+            return False
+        if name.startswith("ST") or name.startswith("*ST") or "退" in name:
+            return False
+        return True
+    df = df[df["ts_code"].apply(_name_ok)]
+    return df.reset_index(drop=True)
+
+
+# ───────── B轨各项评分函数 ─────────
+def _score_policy(industry: str, name: str) -> tuple:
+    """政策赛道命中：满分6分。返回 (得分, 命中的关键词)"""
+    text = (industry or "") + " " + (name or "")
+    hits = [k for k in POLICY_KEYWORDS if k in text]
+    if not hits:
+        return 0, []
+    # 命中越多分越高，但单次最多6分
+    return min(6, 3 + len(hits) * 2), hits
+
+
+def _score_sector_momentum(industry: str, sector_30d_rank: dict) -> int:
+    """行业景气度：满分4。所属行业近30日资金流入排名前30%"""
+    if not industry or industry not in sector_30d_rank:
+        return 0
+    rank, total = sector_30d_rank[industry]
+    pct = rank / max(total, 1)
+    if pct <= 0.1:  return 4
+    if pct <= 0.2:  return 3
+    if pct <= 0.3:  return 2
+    if pct <= 0.5:  return 1
+    return 0
+
+
+def _score_market_cap(circ_mv_wan: float) -> int:
+    """市值弹性：满分2。50-200亿最优"""
+    yi = circ_mv_wan / 10000
+    if 50 <= yi <= 200:  return 2
+    if 30 <= yi < 50 or 200 < yi <= 500:  return 1
+    return 0
+
+
+def _score_form(hist_df: pd.DataFrame) -> tuple:
+    """
+    形态评分：底部充分(4) + 均线粘合(4) + 放量初现(3) = 满分11
+    输入 hist_df: 最近250天日线（升序）
+    返回 (得分细项 dict, 总分)
+    """
+    parts = {"bottom": 0, "ma_glue": 0, "vol_emerge": 0}
+    if hist_df is None or len(hist_df) < 60:
+        return parts, 0
+
+    # 1. 底部充分（4分）：250日内最高/最低 < 1.5
+    h_max = hist_df["high"].max()
+    l_min = hist_df["low"][hist_df["low"] > 0].min()
+    if l_min and l_min > 0:
+        amp = h_max / l_min
+        if amp < 1.3:    parts["bottom"] = 4
+        elif amp < 1.5:  parts["bottom"] = 3
+        elif amp < 1.8:  parts["bottom"] = 2
+        elif amp < 2.2:  parts["bottom"] = 1
+
+    # 2. 均线粘合（4分）：MA5/10/20/60 的极差/当前价 < 5%
+    closes = hist_df["close"].astype(float).tolist()
+    if len(closes) >= 60:
+        ma5  = sum(closes[-5:])  / 5
+        ma10 = sum(closes[-10:]) / 10
+        ma20 = sum(closes[-20:]) / 20
+        ma60 = sum(closes[-60:]) / 60
+        cur  = closes[-1]
+        if cur > 0:
+            mas = [ma5, ma10, ma20, ma60]
+            spread = (max(mas) - min(mas)) / cur
+            if spread < 0.02:   parts["ma_glue"] = 4
+            elif spread < 0.04: parts["ma_glue"] = 3
+            elif spread < 0.06: parts["ma_glue"] = 2
+            elif spread < 0.10: parts["ma_glue"] = 1
+
+    # 3. 放量初现（3分）：近5日均量 / 近60日均量
+    vols = hist_df["vol"].astype(float).tolist()
+    if len(vols) >= 60:
+        v5  = sum(vols[-5:])  / 5
+        v60 = sum(vols[-60:]) / 60
+        if v60 > 0:
+            ratio = v5 / v60
+            if 1.5 <= ratio <= 3.0:  parts["vol_emerge"] = 3  # 温和放量
+            elif 1.2 <= ratio < 1.5: parts["vol_emerge"] = 2
+            elif 3.0 < ratio <= 5.0: parts["vol_emerge"] = 1  # 偏大但未天量
+            # >5 不给分（天量风险）
+
+    return parts, sum(parts.values())
+
+
+def _get_chip_concentration_score(conn, ts_code: str) -> tuple:
+    """
+    筹码集中（股东户数）：满分5。连续两季下降满分，一季下降部分分。
+    返回 (得分, 描述)
+    """
+    cached = _get_cached_quarterly(conn, ts_code, "holdernumber", max_age_days=80)
+    if cached is None:
+        try:
+            df = pro.stk_holdernumber(ts_code=ts_code,
+                                      start_date=(_bj - datetime.timedelta(days=400)).strftime("%Y%m%d"),
+                                      end_date=TODAY,
+                                      fields="ts_code,end_date,holder_num")
+            if df is None or df.empty:
+                return 0, ""
+            df = df.sort_values("end_date", ascending=False).head(4)
+            for _, r in df.iterrows():
+                _save_quarterly(conn, ts_code, "holdernumber", r["end_date"], str(int(r["holder_num"])))
+            cached = [(r["end_date"], str(int(r["holder_num"])), "") for _, r in df.iterrows()]
+        except Exception as e:
+            return 0, ""
+
+    if not cached or len(cached) < 2:
+        return 0, ""
+    try:
+        nums = [int(c[1]) for c in cached if c[1]]
+    except Exception:
+        return 0, ""
+    if len(nums) < 2:
+        return 0, ""
+
+    # cached是按end_date降序的
+    if len(nums) >= 3 and nums[0] < nums[1] < nums[2]:
+        chg = (nums[0] - nums[2]) / max(nums[2], 1) * 100
+        return 5, f"户数连续2季下降{chg:.0f}%"
+    if nums[0] < nums[1]:
+        chg = (nums[0] - nums[1]) / max(nums[1], 1) * 100
+        return 3, f"户数下降{chg:.0f}%"
+    return 0, ""
+
+
+def _get_institution_score(conn, ts_code: str) -> tuple:
+    """
+    机构持仓：满分4。十大流通股东里有≥2个机构席位满分，1个机构2分。
+    返回 (得分, 描述)
+    """
+    cached = _get_cached_quarterly(conn, ts_code, "top10float", max_age_days=80)
+    if cached is None:
+        try:
+            df = pro.top10_floatholders(ts_code=ts_code,
+                                        start_date=(_bj - datetime.timedelta(days=180)).strftime("%Y%m%d"),
+                                        end_date=TODAY,
+                                        fields="ts_code,end_date,holder_name,hold_amount")
+            if df is None or df.empty:
+                return 0, ""
+            latest = df["end_date"].max()
+            df_latest = df[df["end_date"] == latest]
+            holders = "|".join(df_latest["holder_name"].tolist())
+            _save_quarterly(conn, ts_code, "top10float", latest, holders)
+            cached = [(latest, holders, "")]
+        except Exception:
+            return 0, ""
+
+    if not cached:
+        return 0, ""
+    holders_str = cached[0][1] if cached[0][1] else ""
+    holders = holders_str.split("|")
+    inst_count = sum(1 for h in holders if any(k in h for k in INSTITUTIONAL_KEYWORDS))
+    if inst_count >= 3:  return 4, f"前十有{inst_count}个机构"
+    if inst_count == 2:  return 3, f"前十有2个机构"
+    if inst_count == 1:  return 2, f"前十有1个机构"
+    return 0, ""
+
+
+def _get_holder_trade_score(conn, ts_code: str) -> tuple:
+    """
+    大股东增减持：满分3。近90日净增持满分，净减持0分。
+    缓存7天。
+    """
+    c = conn.cursor()
+    c.execute("SELECT net_change, fetched_at FROM holder_trade_cache WHERE ts_code=?", (ts_code,))
+    row = c.fetchone()
+    net_chg = None
+    if row:
+        try:
+            fetched = datetime.datetime.strptime(row[1][:10], "%Y-%m-%d")
+            if (datetime.datetime.utcnow() - fetched).days < 7:
+                net_chg = row[0]
+        except Exception:
+            net_chg = None
+
+    if net_chg is None:
+        try:
+            start_d = (_bj - datetime.timedelta(days=90)).strftime("%Y%m%d")
+            df = pro.stk_holdertrade(ts_code=ts_code, start_date=start_d, end_date=TODAY)
+            if df is not None and not df.empty:
+                # in_de: IN=增持, DE=减持。change_vol是股数
+                signs = df["in_de"].map({"IN": 1, "DE": -1}).fillna(0)
+                net = (signs * df["change_vol"].astype(float).fillna(0)).sum()
+                net_chg = float(net)
+            else:
+                net_chg = 0.0
+            conn.execute("""INSERT OR REPLACE INTO holder_trade_cache
+                (ts_code, net_change, fetched_at) VALUES (?,?,?)""",
+                (ts_code, net_chg,
+                 datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+        except Exception:
+            return 0, ""
+
+    if net_chg is None or net_chg == 0:
+        return 0, ""
+    if net_chg > 0:
+        return 3, f"大股东近90日净增持{net_chg/1e6:.1f}百万股"
+    return 0, "大股东净减持（已扣减）"
+
+
+def _get_earnings_score(conn, ts_code: str) -> tuple:
+    """
+    业绩改善：满分5。最近一季净利润同比 >50%(5), >30%(4), >0(2), 扭亏(4), 负(0)
+    """
+    cached = _get_cached_quarterly(conn, ts_code, "fina", max_age_days=80)
+    if cached is None:
+        try:
+            df = pro.fina_indicator(ts_code=ts_code,
+                                    start_date=(_bj - datetime.timedelta(days=400)).strftime("%Y%m%d"),
+                                    end_date=TODAY,
+                                    fields="ts_code,end_date,netprofit_yoy,q_netprofit_yoy")
+            if df is None or df.empty:
+                return 0, ""
+            df = df.sort_values("end_date", ascending=False).head(1)
+            r = df.iloc[0]
+            yoy = safe_float(r.get("q_netprofit_yoy")) or safe_float(r.get("netprofit_yoy"))
+            _save_quarterly(conn, ts_code, "fina", r["end_date"], f"{yoy:.2f}")
+            cached = [(r["end_date"], f"{yoy:.2f}", "")]
+        except Exception:
+            return 0, ""
+
+    if not cached:
+        return 0, ""
+    try:
+        yoy = float(cached[0][1])
+    except Exception:
+        return 0, ""
+    if yoy >= 50:    return 5, f"净利润同比+{yoy:.0f}%"
+    if yoy >= 30:    return 4, f"净利润同比+{yoy:.0f}%"
+    if yoy >= 0:     return 2, f"净利润同比+{yoy:.0f}%"
+    return 0, f"净利润同比{yoy:.0f}%"
+
+
+def _score_overheat(hist_df: pd.DataFrame) -> tuple:
+    """
+    防过热：满分3。近20日涨幅 <20%(3), 20-40%(1), >40%(0)
+    """
+    if hist_df is None or len(hist_df) < 20:
+        return 3, ""
+    closes = hist_df["close"].astype(float).tolist()
+    if len(closes) < 20 or closes[-20] <= 0:
+        return 3, ""
+    chg20 = (closes[-1] / closes[-20] - 1) * 100
+    if chg20 < 20:  return 3, f"20日{chg20:+.0f}%"
+    if chg20 < 40:  return 1, f"20日{chg20:+.0f}%（偏热）"
+    return 0, f"20日{chg20:+.0f}%（过热）"
+
+
+# ───────── B轨主入口 ─────────
+def find_potential_stocks(price_df, basic_df, names_map,
+                          sector_30d_rank: dict, top_n=15) -> list:
+    """
+    B轨「潜伏标的」综合打分。
+    满分约 40 分（政策6 + 行业4 + 市值2 + 形态11 + 筹码5 + 机构4 + 增持3 + 业绩5 + 防过热3 - 不一定全部满）
+    返回 TOP_n 列表（按总分降序）。
+    """
+    print("【B轨】潜伏标的扫描...")
+    df = _eligible_candidates(price_df, basic_df, names_map)
+    if df.empty:
+        print("  无符合准入条件的标的")
+        return []
+    print(f"  准入候选：{len(df)}只")
+
+    conn = _init_cache_db()
+
+    # 先用「政策+行业+市值+防过热」快速预筛，把候选池压到 100 只再做重的形态/筹码/财务
+    pre_scored = []
+    for _, row in df.iterrows():
+        code = row["ts_code"]
+        name, industry = names_map.get(code, ("", ""))
+        s_pol, hits = _score_policy(industry, name)
+        s_sec       = _score_sector_momentum(industry, sector_30d_rank)
+        s_mv        = _score_market_cap(safe_float(row["circ_mv"]))
+        # 没有政策也没有行业景气度，直接不进重算
+        if s_pol == 0 and s_sec == 0:
+            continue
+        pre_scored.append({
+            "code": code, "name": name, "industry": industry,
+            "circ_mv": safe_float(row["circ_mv"]),
+            "_pre": s_pol + s_sec + s_mv,
+            "s_pol": s_pol, "s_sec": s_sec, "s_mv": s_mv,
+            "policy_hits": hits,
+        })
+    pre_scored.sort(key=lambda x: x["_pre"], reverse=True)
+    candidates = pre_scored[:120]   # 限制到120只做重计算（控制API调用）
+    print(f"  政策/行业预筛后：{len(candidates)}只进入深度评分")
+
+    # 保证日线缓存就绪（一次性）
+    _ensure_daily_history(conn, candidates, end_date=TODAY, lookback_days=250)
+
+    # 历史日线起止
+    start_d = (_bj - datetime.timedelta(days=400)).strftime("%Y%m%d")
+
+    results = []
+    for i, stk in enumerate(candidates):
+        try:
+            hist = _get_cached_daily(conn, stk["code"], start_d, TODAY)
+
+            # 形态
+            form_parts, s_form_total = _score_form(hist)
+            # 防过热
+            s_over, over_desc        = _score_overheat(hist)
+            # 筹码
+            s_chip, chip_desc        = _get_chip_concentration_score(conn, stk["code"])
+            # 机构
+            s_inst, inst_desc        = _get_institution_score(conn, stk["code"])
+            # 增减持
+            s_hldr, hldr_desc        = _get_holder_trade_score(conn, stk["code"])
+            # 业绩
+            s_earn, earn_desc        = _get_earnings_score(conn, stk["code"])
+
+            total = (stk["s_pol"] + stk["s_sec"] + stk["s_mv"]
+                     + s_form_total + s_chip + s_inst + s_hldr + s_earn + s_over)
+
+            results.append({
+                "code":     stk["code"],
+                "name":     stk["name"],
+                "industry": stk["industry"],
+                "circ_mv_yi": round(stk["circ_mv"] / 10000, 1),
+                "total":    total,
+                "scores": {
+                    "政策": stk["s_pol"],
+                    "行业资金": stk["s_sec"],
+                    "市值":   stk["s_mv"],
+                    "形态":   s_form_total,
+                    "筹码":   s_chip,
+                    "机构":   s_inst,
+                    "增持":   s_hldr,
+                    "业绩":   s_earn,
+                    "防过热": s_over,
+                },
+                "form_detail": form_parts,
+                "notes": {
+                    "policy":   "、".join(stk["policy_hits"][:3]) if stk["policy_hits"] else "",
+                    "chip":     chip_desc,
+                    "inst":     inst_desc,
+                    "holder":   hldr_desc,
+                    "earnings": earn_desc,
+                    "overheat": over_desc,
+                },
+            })
+            if (i+1) % 25 == 0:
+                print(f"    评分进度 {i+1}/{len(candidates)}")
+        except Exception as e:
+            print(f"    {stk['code']} 评分失败: {e}")
+            continue
+
+    results.sort(key=lambda x: x["total"], reverse=True)
+    print(f"  B轨潜伏标的：返回TOP{top_n}（最高分{results[0]['total'] if results else 0}）")
+    conn.close()
+    return results[:top_n]
+
+
+def get_sector_30d_rank() -> dict:
+    """
+    返回 {行业名: (排名, 总数)}，基于近30个交易日 moneyflow_ind_ths 累计净流入。
+    用于B轨"行业景气度"评分。
+    """
+    print("【行业30日资金】累计...")
+    end_d = TODAY
+    start_d = (_bj - datetime.timedelta(days=45)).strftime("%Y%m%d")
+    try:
+        cal = pro.trade_cal(exchange="", start_date=start_d, end_date=end_d, is_open="1")
+        trade_dates = sorted(cal["cal_date"].tolist())[-30:] if cal is not None else []
+    except Exception as e:
+        print(f"  trade_cal失败: {e}")
+        return {}
+
+    agg = {}
+    for d in trade_dates:
+        try:
+            df = pro.moneyflow_ind_ths(trade_date=d)
+            if df is None or df.empty:
+                continue
+            for _, r in df.iterrows():
+                ind = r.get("industry", "")
+                if ind:
+                    agg[ind] = agg.get(ind, 0.0) + safe_float(r.get("net_amount", 0))
+            time.sleep(0.2)
+        except Exception:
+            continue
+
+    if not agg:
+        return {}
+    items = sorted(agg.items(), key=lambda x: x[1], reverse=True)
+    total = len(items)
+    rank_map = {ind: (i+1, total) for i, (ind, _) in enumerate(items)}
+    print(f"  行业30日资金：{total}个板块完成排名")
+    return rank_map
+
+
+# ───────── B轨 HTML 展示 ─────────
+def build_potential_html_section(potentials: list) -> str:
+    """生成B轨结果的HTML片段，嵌入收盘报告/周报。"""
+    if not potentials:
+        return """<div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+        <div style="font-size:13px;font-weight:500;color:#2d3436;margin-bottom:8px">
+          B轨「潜伏标的」 <span style="color:#aaa;font-size:11px;font-weight:400">· 政策×资金×筹码×形态综合评分</span>
+        </div>
+        <div style="padding:18px;text-align:center;color:#aaa;font-size:12px">暂无符合政策赛道的标的</div>
+      </div>"""
+
+    rows = []
+    for s in potentials:
+        sc = s["scores"]
+        notes_chips = []
+        if s["notes"]["policy"]:   notes_chips.append(f"<span style='color:#6c5ce7'>政策:{s['notes']['policy']}</span>")
+        if s["notes"]["earnings"]: notes_chips.append(f"<span style='color:#d63031'>{s['notes']['earnings']}</span>")
+        if s["notes"]["chip"]:     notes_chips.append(f"<span style='color:#0984e3'>{s['notes']['chip']}</span>")
+        if s["notes"]["inst"]:     notes_chips.append(f"<span style='color:#00b894'>{s['notes']['inst']}</span>")
+        if s["notes"]["holder"]:   notes_chips.append(f"<span style='color:#fdcb6e'>{s['notes']['holder']}</span>")
+        notes_html = " · ".join(notes_chips) or "<span style='color:#aaa'>—</span>"
+
+        score_breakdown = " ".join([
+            f"<span style='color:#888'>政{sc['政策']}</span>",
+            f"<span style='color:#888'>业{sc['业绩']}</span>",
+            f"<span style='color:#888'>筹{sc['筹码']}</span>",
+            f"<span style='color:#888'>机{sc['机构']}</span>",
+            f"<span style='color:#888'>形{sc['形态']}</span>",
+            f"<span style='color:#888'>资{sc['行业资金']}</span>",
+        ])
+
+        rows.append(f"""
+        <tr>
+          <td style='padding:6px 8px;font-weight:500'>{s['name']}</td>
+          <td style='padding:6px 8px;color:#666;font-size:11px'>{s['industry']}</td>
+          <td style='padding:6px 8px;color:#888;font-size:11px'>{s['code']}</td>
+          <td style='padding:6px 8px;text-align:right;font-size:11px'>{s['circ_mv_yi']}亿</td>
+          <td style='padding:6px 8px;text-align:right;font-weight:600;color:#6c5ce7'>{s['total']}</td>
+          <td style='padding:6px 8px;font-size:10px;line-height:1.6'>{score_breakdown}<br/>{notes_html}</td>
+        </tr>""")
+
+    return f"""<div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+      <div style="font-size:13px;font-weight:500;color:#2d3436;margin-bottom:4px">
+        B轨「潜伏标的」 TOP{len(potentials)}
+      </div>
+      <div style="font-size:11px;color:#888;margin-bottom:10px">
+        政策×行业资金×市值×形态×筹码×机构×增持×业绩 综合评分（满分约40）· 找还没启动但条件齐备的标的
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="background:#f8f9fa;color:#888">
+          <th style="padding:5px 8px;text-align:left;font-weight:400">名称</th>
+          <th style="padding:5px 8px;text-align:left;font-weight:400">行业</th>
+          <th style="padding:5px 8px;text-align:left;font-weight:400">代码</th>
+          <th style="padding:5px 8px;text-align:right;font-weight:400">流通市值</th>
+          <th style="padding:5px 8px;text-align:right;font-weight:400">总分</th>
+          <th style="padding:5px 8px;text-align:left;font-weight:400">细分</th>
+        </tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+    </div>"""
+
+
+def ai_potential_review(potentials: list) -> str:
+    """对TOP10潜伏标的做一段AI解读，引用真实分项。"""
+    if not potentials:
+        return "本轮B轨暂无符合政策赛道的潜伏标的，建议下一轮观察。"
+    lines = []
+    for s in potentials[:10]:
+        sc = s["scores"]
+        notes = " | ".join([v for v in [
+            s["notes"]["policy"] and f"政策赛道:{s['notes']['policy']}",
+            s["notes"]["earnings"],
+            s["notes"]["chip"], s["notes"]["inst"], s["notes"]["holder"],
+        ] if v])
+        lines.append(
+            f"{s['name']}({s['code']}, {s['industry']}, {s['circ_mv_yi']}亿) "
+            f"总分{s['total']}（政策{sc['政策']}/业绩{sc['业绩']}/筹码{sc['筹码']}/机构{sc['机构']}/形态{sc['形态']}/资金{sc['行业资金']}）{notes}"
+        )
+    data_block = "\n".join(lines)
+    prompt = f"""以下是「B轨潜伏标的」综合评分系统输出的TOP10（按总分降序）。
+评分维度：政策赛道命中(6) + 行业资金景气度(4) + 市值弹性(2) + 形态底部+均线粘合+温和放量(11) + 筹码集中(5) + 机构持仓(4) + 大股东增持(3) + 业绩改善(5) + 防过热(3)。
+
+{data_block}
+
+请基于上方真实数据写一段简短复盘（300-500字），要求：
+1. 指出本轮潜伏标的最集中的政策赛道（出现最多的关键词方向）
+2. 挑出2-3只综合质量最高的标的，逐只点评（政策/业绩/筹码三个角度），不超过3行
+3. 整体提示：哪些维度的得分整体偏低（说明市场欠缺什么）
+4. 不构成投资建议，不预测涨幅，不引用列表外的股票。
+"""
+    return ask_deepseek(prompt, max_tokens=1500)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1999,7 +2684,16 @@ def main():
         # 5. 本周重大新闻
         weekly_news        = get_weekly_news()
 
-        # 6. AI 周度复盘
+        # 6. B轨：潜伏标的（用周五数据跑）
+        try:
+            sector_30d = get_sector_30d_rank()
+            potentials = find_potential_stocks(price_df, basic_df, names, sector_30d, top_n=15)
+            potential_ai = ai_potential_review(potentials) if potentials else ""
+        except Exception as e:
+            print(f"  B轨执行失败: {e}")
+            potentials, potential_ai = [], ""
+
+        # 7. AI 周度复盘
         ai_report = ai_weekly_review(
             week_dates, idx_perf, sector_flow_week,
             top_stocks, weekly_news, stocks_friday
@@ -2009,6 +2703,16 @@ def main():
             subject, ai_report, week_dates, idx_perf,
             sector_flow_week, top_stocks, weekly_news, stocks_friday
         )
+        # 周报HTML的footer是: <div style="text-align:center;color:#aaa
+        if potentials:
+            b_html = build_potential_html_section(potentials)
+            if potential_ai:
+                b_html += f"""<div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+                <div style="font-size:13px;font-weight:500;color:#6c5ce7;margin-bottom:10px">B轨 AI 解读</div>
+                <div style="color:#2d3436;line-height:1.9;font-size:13px">{md_to_html(potential_ai)}</div></div>"""
+            html = html.replace('<div style="text-align:center;color:#aaa',
+                                b_html + '<div style="text-align:center;color:#aaa', 1)
+
         send_email(subject, html)
         save_report(html, "周报")
 
@@ -2069,6 +2773,16 @@ def main():
             financial = get_financial_data()
 
         stocks = quant_and_tech_filter(price_df, basic_df, names, factor_df)
+
+        # B轨：潜伏标的（政策×资金×筹码×形态 综合评分）
+        try:
+            sector_30d = get_sector_30d_rank()
+            potentials = find_potential_stocks(price_df, basic_df, names, sector_30d, top_n=15)
+            potential_ai = ai_potential_review(potentials) if potentials else ""
+        except Exception as e:
+            print(f"  B轨执行失败: {e}")
+            potentials, potential_ai = [], ""
+
         ai_report = ai_closing_report(
             policy_news, stocks, market_sentiment,
             northbound, moneyflow, dragon_tiger,
@@ -2082,6 +2796,18 @@ def main():
             northbound, moneyflow, dragon_tiger,
             block_trade, sector_flow, broker_rec
         )
+
+        # 把B轨HTML和AI解读注入到footer之前
+        if potentials:
+            b_html = build_potential_html_section(potentials)
+            if potential_ai:
+                b_html += f"""<div style="background:#fff;padding:18px;border-radius:12px;margin-bottom:16px">
+                <div style="font-size:13px;font-weight:500;color:#6c5ce7;margin-bottom:10px">B轨 AI 解读</div>
+                <div style="color:#2d3436;line-height:1.9;font-size:13px">{md_to_html(potential_ai)}</div></div>"""
+            # 收盘报告footer是 <div style="padding:10px 28px;background:#f8f9fa
+            html = html.replace('<div style="padding:10px 28px;background:#f8f9fa',
+                                b_html + '<div style="padding:10px 28px;background:#f8f9fa', 1)
+
         send_email(subject, html)
         save_report(html, "收盘复盘")
 
