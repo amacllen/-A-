@@ -296,9 +296,13 @@ def get_morning_news() -> list:
                 end_date=today_str + " 23:59:59",
                 fields="datetime,title"
             )
-            if df is None or len(df) == 0:
-                print(f"  {src}新闻：今日暂无")
+            if df is None:
+                print(f"  {src}新闻：接口返回None（可能API失败/积分不足/token问题）")
                 continue
+            if len(df) == 0:
+                print(f"  {src}新闻：接口返回0条（数据源可能未入库）")
+                continue
+            print(f"  {src}新闻：接口返回{len(df)}条（去重前），开始过滤今日")
             for _, row in df.iterrows():
                 pub_time = str(row.get("datetime", ""))
                 # 严格验证是今天
@@ -317,10 +321,12 @@ def get_morning_news() -> list:
                     "src":   src.upper(),
                 })
             if result:
-                print(f"  {src.upper()}新闻：今日{len(result)}条")
+                print(f"  {src.upper()}新闻：今日有效{len(result)}条")
                 break
+            else:
+                print(f"  {src}新闻：返回{len(df)}条但无今日条目，可能日期过滤过严")
         except Exception as e:
-            print(f"  {src}新闻失败: {e}")
+            print(f"  {src}新闻失败: {type(e).__name__}: {e}")
 
     if not result:
         print("  今日新闻：暂无数据")
@@ -1756,7 +1762,7 @@ def ai_morning_report(news_data, announcements, yest_capital) -> str:
     news_text = "\n".join(
         f"[{n['time']}] [{n['src']}] {n['title']}"
         for n in news_data
-    ) if news_data else "今日暂无政策相关新闻"
+    ) if news_data else "今日新闻接口暂无返回（可能数据源未入库或接口异常，非市场无新闻）"
 
     # 今日公告
     ann_text = "\n".join(
@@ -1834,7 +1840,7 @@ def build_morning_html(title, ai_report, news_data, announcements, yest_capital)
         f"<td style='padding:5px 8px;font-size:12px'>{n['title']}</td>"
         f"</tr>"
         for n in news_data[:12]
-    ) or "<tr><td colspan='2' style='padding:10px;text-align:center;color:#aaa'>今日暂无政策相关新闻</td></tr>"
+    ) or "<tr><td colspan='2' style='padding:10px;text-align:center;color:#aaa'>今日新闻接口暂无返回（可能数据源未入库或接口异常）</td></tr>"
 
     # 今日公告
     ann_items = "".join(
