@@ -64,13 +64,24 @@ elif NOW_H == 10 and NOW_M >= 20:
     MODE = "financial"
 else:
     # 手动触发时根据北京时间判断
-    bj_h = _bj.hour
-    if bj_h < 14:
+    bj_h    = _bj.hour
+    bj_min  = _bj.minute
+    bj_hm   = bj_h * 60 + bj_min   # 北京时间分钟数
+    if bj_hm < 9 * 60 + 25:
+        # 09:25之前：盘前，按上午快报处理
         MODE = "morning"
-    elif bj_h < 18:
-        MODE = "closing"
+    elif bj_hm < 15 * 60 + 30:
+        # 盘中(09:25 → 15:30)：A股未收盘，当日收盘数据未入库
+        # 默认走上午快报模式，避免生成空数据收盘报告
+        MODE = "morning"
+        print(f"⚠ 盘中触发({_bj.strftime('%H:%M')})：A股未收盘，自动降级为上午快报模式")
+        print(f"  如需收盘报告，请在 15:30 之后触发（建议 18:00 后，资金/龙虎榜数据完整）")
     else:
+        # 15:30后：可以跑收盘报告（部分数据可能要等到18:00才入库齐全）
         MODE = "closing"
+        if bj_hm < 18 * 60:
+            print(f"⚠ 提前触发收盘报告({_bj.strftime('%H:%M')})：")
+            print(f"  涨跌停/连板/龙虎榜/主力资金 通常在18:00后才入库完整，本次报告可能数据不全")
 
 # 财报季判断
 def is_earnings_season() -> bool:
